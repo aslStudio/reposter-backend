@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: reposter
+      POSTGRES_USER: reposter
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reposter -d reposter"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://reposter:${POSTGRES_PASSWORD}@postgres:5432/reposter?sslmode=disable
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      CODEX_API_KEY: ${CODEX_API_KEY:-}
+      CODEX_MODEL: ${CODEX_MODEL:-gpt-6-luna}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
+      REPLAY_LATEST_ON_FIRST_POLL: ${REPLAY_LATEST_ON_FIRST_POLL:-false}
+      HTTP_ADDR: :8080
+      MEDIA_DIR: /data/media
+      BOOTSTRAP_TG_SOURCE: ${BOOTSTRAP_TG_SOURCE:-}
+      BOOTSTRAP_TG_DESTINATION: ${BOOTSTRAP_TG_DESTINATION:-}
+      BOOTSTRAP_TG_STYLE: ${BOOTSTRAP_TG_STYLE:-}
+      BOOTSTRAP_TG_MODE: ${BOOTSTRAP_TG_MODE:-}
+      BOOTSTRAP_TG_DAILY_LIMIT: ${BOOTSTRAP_TG_DAILY_LIMIT:-}
+      BOOTSTRAP_TG_FORMATTING_ENABLED: ${BOOTSTRAP_TG_FORMATTING_ENABLED:-false}
+      BOOTSTRAP_TG_SIGNATURE_TEXT: ${BOOTSTRAP_TG_SIGNATURE_TEXT:-}
+    volumes:
+      - media_data:/data/media
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  postgres_data:
+  media_data:

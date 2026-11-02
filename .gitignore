@@ -1,0 +1,8 @@
+docs/product-plan.private.md
+.env
+.env.*
+!.env.example
+bin/
+coverage.out
+.DS_Store
+data/

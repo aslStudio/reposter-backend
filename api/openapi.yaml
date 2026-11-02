@@ -1,0 +1,193 @@
+openapi: 3.0.3
+info:
+  title: Reposter local admin API
+  version: 0.1.0
+  description: Single-operator API for the first Telegram integration. Not a public multi-user API.
+servers:
+  - url: http://localhost:8080
+security:
+  - AdminToken: []
+components:
+  securitySchemes:
+    AdminToken:
+      type: apiKey
+      in: header
+      name: X-Admin-Token
+  schemas:
+    Source:
+      type: object
+      required: [id, handle, url]
+      properties:
+        id: {type: integer, format: int64}
+        handle: {type: string}
+        url: {type: string, format: uri}
+    Destination:
+      type: object
+      required: [id, chat_id, style_prompt, mode, daily_limit, formatting_enabled, signature_text]
+      properties:
+        id: {type: integer, format: int64}
+        chat_id: {type: string}
+        style_prompt: {type: string}
+        mode: {type: string, enum: [manual_approval, automatic]}
+        daily_limit: {type: integer, minimum: 0, maximum: 100, description: '0 disables the daily limit'}
+        formatting_enabled: {type: boolean, description: 'Render supported Markdown formatting in Telegram messages'}
+        signature_text: {type: string, maxLength: 200, description: 'Optional footer label linked to the public destination channel; empty disables the footer'}
+    Draft:
+      type: object
+      required: [id, source_url, destination_id, body, media_urls, status, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        source_url: {type: string, format: uri}
+        destination_id: {type: integer, format: int64}
+        body: {type: string}
+        media_urls: {type: array, items: {type: string}}
+        status: {type: string, enum: [pending_approval, ready_to_publish, publishing, published, publish_failed]}
+        external_post_id: {type: string}
+        error: {type: string}
+        created_at: {type: string, format: date-time}
+    Error:
+      type: object
+      properties:
+        error: {type: string}
+paths:
+  /healthz:
+    get:
+      security: []
+      summary: Check application and database readiness
+      responses:
+        '200': {description: Ready}
+        '503': {description: Database unavailable}
+  /v1/sources:
+    get:
+      summary: List public Telegram sources
+      responses:
+        '200':
+          description: Sources
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Source'}}
+    post:
+      summary: Add a public Telegram source
+      description: The first poll records the latest post as a baseline and does not create drafts from old posts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: {type: string, example: 'https://t.me/example_channel'}
+      responses:
+        '201':
+          description: Source created or already present
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Source'}
+        '400': {description: Invalid public channel link}
+  /v1/destinations:
+    get:
+      summary: List Telegram destinations
+      responses:
+        '200':
+          description: Destinations
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Destination'}}
+    post:
+      summary: Add a Telegram channel owned by the operator
+      description: The configured bot must be a channel administrator with permission to post. A non-empty signature_text requires a public @username destination; the link target is derived from chat_id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [chat_id, style_prompt, mode, daily_limit]
+              properties:
+                chat_id: {type: string, example: '@my_channel'}
+                style_prompt: {type: string, maxLength: 5000}
+                mode: {type: string, enum: [manual_approval, automatic]}
+                daily_limit: {type: integer, minimum: 0, maximum: 100, description: '0 disables the daily limit'}
+                formatting_enabled: {type: boolean, description: 'Render supported Markdown formatting in Telegram messages'}
+                signature_text: {type: string, maxLength: 200, description: 'Optional footer label linked to the public destination channel'}
+      responses:
+        '201':
+          description: Destination created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Destination'}
+        '400': {description: Invalid settings}
+  /v1/routes:
+    post:
+      summary: Route one source to one destination
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_id, destination_id]
+              properties:
+                source_id: {type: integer, format: int64}
+                destination_id: {type: integer, format: int64}
+      responses:
+        '201': {description: Route created or already present}
+        '400': {description: Invalid or missing source or destination}
+  /v1/drafts:
+    get:
+      summary: List the latest 100 drafts
+      parameters:
+        - in: query
+          name: status
+          schema: {type: string, enum: [pending_approval, ready_to_publish, publishing, published, publish_failed]}
+      responses:
+        '200':
+          description: Drafts
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Draft'}}
+  /v1/drafts/{id}/approve:
+    post:
+      summary: Queue a draft for publication
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: integer, format: int64}
+      responses:
+        '200': {description: Draft queued}
+        '409': {description: Draft is not awaiting approval}
+  /v1/drafts/{id}/retry:
+    post:
+      summary: Requeue a draft rejected because the bot was not a channel member
+      description: Only a definitive Telegram 403 rejection with no external post ID can be retried. Other failed outcomes require manual inspection to avoid duplicate posts.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: integer, format: int64}
+      responses:
+        '200': {description: Draft queued for publication}
+        '409': {description: Draft is not eligible for safe retry}
+  /v1/drafts/{id}/media/{index}:
+    get:
+      summary: Download a saved draft image
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: integer, format: int64}
+        - in: path
+          name: index
+          required: true
+          schema: {type: integer, minimum: 0}
+      responses:
+        '200': {description: Image bytes}
+        '404': {description: Image not found}
+  /v1/poll:
+    post:
+      summary: Run a source poll and publication cycle now
+      responses:
+        '200': {description: Cycle complete}
+        '502': {description: A source or publication failed; inspect logs and drafts}
