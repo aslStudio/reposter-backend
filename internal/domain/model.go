@@ -41,6 +41,7 @@ type Destination struct {
 	Platform       Platform
 	ExternalID     string
 	StylePrompt    string
+	Language       string
 	Mode           PublishMode
 	DailyPostLimit int
 }

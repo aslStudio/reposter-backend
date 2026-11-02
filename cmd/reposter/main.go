@@ -15,9 +15,11 @@ import (
 
 	"reposter/internal/app"
 	"reposter/internal/httpapi"
+	"reposter/internal/locale"
 	"reposter/internal/rewrite"
 	"reposter/internal/store"
 	"reposter/internal/telegram"
+	"reposter/internal/x"
 )
 
 func main() {
@@ -56,11 +58,23 @@ func main() {
 		logger.Error("Telegram bootstrap failed", "error", err)
 		os.Exit(1)
 	}
+	if err = bootstrapX(ctx, db); err != nil {
+		logger.Error("X bootstrap failed", "error", err)
+		os.Exit(1)
+	}
 	mediaDir := os.Getenv("MEDIA_DIR")
 	if mediaDir == "" {
 		mediaDir = "./data/media"
 	}
-	service := &app.Service{Store: db, Reader: telegram.Reader{}, Media: telegram.MediaStore{Dir: mediaDir}, Rewriter: rewrite.Codex{Model: os.Getenv("CODEX_MODEL"), APIKey: os.Getenv("CODEX_API_KEY")}, Bot: telegram.Bot{Token: os.Getenv("TELEGRAM_BOT_TOKEN")}, Logger: logger, ReplayLatestOnFirstPoll: os.Getenv("REPLAY_LATEST_ON_FIRST_POLL") == "true"}
+	var tokenCipher x.TokenCipher
+	if encoded := os.Getenv("X_TOKEN_ENCRYPTION_KEY"); encoded != "" {
+		tokenCipher, err = x.NewTokenCipher(encoded)
+		if err != nil {
+			logger.Error("invalid X token encryption key", "error", err)
+			os.Exit(1)
+		}
+	}
+	service := &app.Service{Store: db, Reader: telegram.Reader{}, X: x.Client{BearerToken: os.Getenv("X_BEARER_TOKEN"), ConsumerKey: os.Getenv("X_CONSUMER_KEY"), ConsumerSecret: os.Getenv("X_SECRET_KEY"), AccessToken: os.Getenv("X_ACCESS_TOKEN"), AccessSecret: os.Getenv("X_ACCESS_TOKEN_SECRET")}, XTokenCipher: tokenCipher, Media: telegram.MediaStore{Dir: mediaDir}, Rewriter: rewrite.Codex{Model: os.Getenv("CODEX_MODEL"), APIKey: os.Getenv("CODEX_API_KEY")}, Bot: telegram.Bot{Token: os.Getenv("TELEGRAM_BOT_TOKEN")}, Logger: logger, ReplayLatestOnFirstPoll: os.Getenv("REPLAY_LATEST_ON_FIRST_POLL") == "true"}
 	interval := time.Minute
 	if raw := os.Getenv("POLL_INTERVAL_SECONDS"); raw != "" {
 		if n, e := strconv.Atoi(raw); e == nil && n >= 30 {
@@ -110,6 +124,58 @@ func main() {
 	}
 }
 
+func bootstrapX(ctx context.Context, db *store.Store) error {
+	sourcesRaw := strings.TrimSpace(os.Getenv("BOOTSTRAP_X_SOURCES"))
+	destinationRaw := strings.TrimSpace(os.Getenv("BOOTSTRAP_X_DESTINATION"))
+	if sourcesRaw == "" && destinationRaw == "" {
+		return nil
+	}
+	if sourcesRaw == "" || destinationRaw == "" {
+		return errors.New("both BOOTSTRAP_X_SOURCES and BOOTSTRAP_X_DESTINATION are required")
+	}
+	destHandle, err := x.ParseHandle(destinationRaw)
+	if err != nil {
+		return err
+	}
+	style := strings.TrimSpace(os.Getenv("BOOTSTRAP_X_STYLE"))
+	if style == "" {
+		return errors.New("BOOTSTRAP_X_STYLE is required")
+	}
+	languageCode := ""
+	if raw := os.Getenv("BOOTSTRAP_X_LANGUAGE"); raw != "" {
+		languageCode, err = locale.Normalize(raw)
+		if err != nil {
+			return errors.New("BOOTSTRAP_X_LANGUAGE must be a valid BCP 47 tag")
+		}
+	}
+	mode := os.Getenv("BOOTSTRAP_X_MODE")
+	if mode != "manual_approval" && mode != "automatic" {
+		return errors.New("BOOTSTRAP_X_MODE must be manual_approval or automatic")
+	}
+	limit, err := strconv.Atoi(os.Getenv("BOOTSTRAP_X_DAILY_LIMIT"))
+	if err != nil || limit < 0 || limit > 100 {
+		return errors.New("BOOTSTRAP_X_DAILY_LIMIT must be 0..100")
+	}
+	dest, err := db.AddDestination(ctx, store.Destination{Platform: "x", ChatID: "@" + destHandle, StylePrompt: style, Language: languageCode, Mode: mode, DailyLimit: limit})
+	if err != nil {
+		return err
+	}
+	for _, raw := range strings.Split(sourcesRaw, ",") {
+		handle, err := x.ParseHandle(strings.TrimSpace(raw))
+		if err != nil {
+			return err
+		}
+		source, err := db.AddPlatformSource(ctx, "x", handle)
+		if err != nil {
+			return err
+		}
+		if _, err = db.AddRoute(ctx, source.ID, dest.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func bootstrapTelegram(ctx context.Context, db *store.Store) error {
 	sourceRaw := os.Getenv("BOOTSTRAP_TG_SOURCE")
 	destinationRaw := os.Getenv("BOOTSTRAP_TG_DESTINATION")
@@ -130,6 +196,13 @@ func bootstrapTelegram(ctx context.Context, db *store.Store) error {
 	style := os.Getenv("BOOTSTRAP_TG_STYLE")
 	if style == "" {
 		return errors.New("BOOTSTRAP_TG_STYLE is required")
+	}
+	languageCode := ""
+	if raw := os.Getenv("BOOTSTRAP_TG_LANGUAGE"); raw != "" {
+		languageCode, err = locale.Normalize(raw)
+		if err != nil {
+			return errors.New("BOOTSTRAP_TG_LANGUAGE must be a valid BCP 47 tag")
+		}
 	}
 	mode := os.Getenv("BOOTSTRAP_TG_MODE")
 	if mode != "manual_approval" && mode != "automatic" {
@@ -154,7 +227,7 @@ func bootstrapTelegram(ctx context.Context, db *store.Store) error {
 	if err != nil {
 		return err
 	}
-	dest, err := db.AddDestination(ctx, store.Destination{ChatID: "@" + destHandle, StylePrompt: style, Mode: mode, DailyLimit: limit, FormattingEnabled: formattingEnabled, SignatureText: signatureText})
+	dest, err := db.AddDestination(ctx, store.Destination{ChatID: "@" + destHandle, StylePrompt: style, Language: languageCode, Mode: mode, DailyLimit: limit, FormattingEnabled: formattingEnabled, SignatureText: signatureText})
 	if err != nil {
 		return err
 	}

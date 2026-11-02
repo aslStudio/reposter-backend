@@ -1,0 +1,157 @@
+{
+  "info": {
+    "name": "Reposter X local connection",
+    "description": "PIN authorization and one explicit test post. Set admin_token and destination_id in a local Postman environment. Never export a filled environment with secrets.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "List destinations",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Admin-Token",
+            "value": "{{admin_token}}"
+          }
+        ],
+        "url": "{{base_url}}/v1/destinations"
+      }
+    },
+    {
+      "name": "1. Start X connection",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "X-Admin-Token",
+            "value": "{{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"destination_id\":{{destination_id}}}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/v1/x/connections/start",
+        "description": "Open authorization_url in a browser signed in as the destination X account. Copy the PIN shown by X."
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Authorization URL returned', function () { pm.response.to.have.status(200); });",
+              "if (pm.response.code === 200) {",
+              "  const data = pm.response.json();",
+              "  pm.collectionVariables.set('request_token', data.request_token);",
+              "  pm.collectionVariables.set('authorization_url', data.authorization_url);",
+              "}"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Complete X connection with PIN",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "X-Admin-Token",
+            "value": "{{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"destination_id\":{{destination_id}},\"request_token\":\"{{request_token}}\",\"pin\":\"{{pin}}\"}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/v1/x/connections/complete"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Connected to destination account', function () { pm.response.to.have.status(200); });",
+              "if (pm.response.code === 200) { pm.collectionVariables.unset('request_token'); pm.collectionVariables.unset('authorization_url'); }"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Publish X test post",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "X-Admin-Token",
+            "value": "{{admin_token}}"
+          },
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"text\":\"Тестовая публикация из Reposter. Подключение X работает.\"}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": "{{base_url}}/v1/x/destinations/{{destination_id}}/test-post"
+      }
+    },
+    {
+      "name": "Retry definitively rejected draft",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "X-Admin-Token",
+            "value": "{{admin_token}}"
+          }
+        ],
+        "url": "{{base_url}}/v1/drafts/{{draft_id}}/retry",
+        "description": "Use only after fixing X OAuth1 app permissions and reconnecting the destination. Set draft_id to one of the rejected drafts."
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8080"
+    },
+    {
+      "key": "request_token",
+      "value": ""
+    },
+    {
+      "key": "authorization_url",
+      "value": ""
+    }
+  ]
+}

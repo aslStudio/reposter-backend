@@ -23,6 +23,7 @@ type PublicPost struct {
 	URL         string
 	Text        string
 	ImageURLs   []string
+	VideoURLs   []string
 	PublishedAt time.Time
 }
 
@@ -149,6 +150,18 @@ func findContent(n *html.Node, p *PublicPost) {
 			if hasClass(node, "tgme_widget_message_photo_wrap") {
 				if match := imageURLRE.FindStringSubmatch(attr(node, "style")); len(match) == 2 {
 					p.ImageURLs = append(p.ImageURLs, match[1])
+				}
+			}
+			if node.Data == "video" {
+				if src := attr(node, "src"); src != "" {
+					p.VideoURLs = append(p.VideoURLs, src)
+				} else {
+					for child := node.FirstChild; child != nil; child = child.NextSibling {
+						if child.Type == html.ElementNode && child.Data == "source" && attr(child, "src") != "" {
+							p.VideoURLs = append(p.VideoURLs, attr(child, "src"))
+							break
+						}
+					}
 				}
 			}
 			if node.Data == "time" {

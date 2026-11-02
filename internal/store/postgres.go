@@ -76,15 +76,20 @@ func (s *Store) Migrate(ctx context.Context) error {
 }
 
 type Source struct {
-	ID     int64  `json:"id"`
-	Handle string `json:"handle"`
-	URL    string `json:"url"`
-	Cursor string `json:"-"`
+	ID             int64      `json:"id"`
+	Platform       string     `json:"platform"`
+	Handle         string     `json:"handle"`
+	URL            string     `json:"url"`
+	Cursor         string     `json:"-"`
+	ExternalUserID string     `json:"-"`
+	LastPolledAt   *time.Time `json:"-"`
 }
 type Destination struct {
 	ID                int64  `json:"id"`
+	Platform          string `json:"platform"`
 	ChatID            string `json:"chat_id"`
 	StylePrompt       string `json:"style_prompt"`
+	Language          string `json:"language"`
 	Mode              string `json:"mode"`
 	DailyLimit        int    `json:"daily_limit"`
 	FormattingEnabled bool   `json:"formatting_enabled"`
@@ -117,23 +122,44 @@ type Draft struct {
 }
 
 func (s *Store) AddSource(ctx context.Context, handle string) (Source, error) {
+	return s.AddPlatformSource(ctx, "telegram", handle)
+}
+func (s *Store) AddPlatformSource(ctx context.Context, platform, handle string) (Source, error) {
 	var out Source
-	err := s.DB.QueryRow(ctx, `INSERT INTO sources(platform, handle, url) VALUES('telegram',$1,$2)
+	if platform != "telegram" && platform != "x" {
+		return out, errors.New("unsupported source platform")
+	}
+	url := "https://t.me/s/" + handle
+	if platform == "x" {
+		url = "https://x.com/" + handle
+	}
+	err := s.DB.QueryRow(ctx, `INSERT INTO sources(platform, handle, url) VALUES($1,$2,$3)
 	 ON CONFLICT(platform,handle) DO UPDATE SET handle=EXCLUDED.handle
-	 RETURNING id,handle,url,cursor`, handle, "https://t.me/s/"+handle).Scan(&out.ID, &out.Handle, &out.URL, &out.Cursor)
+	 RETURNING id,platform,handle,url,cursor,external_user_id,last_polled_at`, platform, handle, url).Scan(&out.ID, &out.Platform, &out.Handle, &out.URL, &out.Cursor, &out.ExternalUserID, &out.LastPolledAt)
 	return out, err
 }
 func (s *Store) AddDestination(ctx context.Context, d Destination) (Destination, error) {
-	err := s.DB.QueryRow(ctx, `INSERT INTO destinations(platform,external_id,style_prompt,mode,daily_post_limit,formatting_enabled,signature_text)
-	 VALUES('telegram',$1,$2,$3,$4,$5,$6)
+	if d.Platform == "" {
+		d.Platform = "telegram"
+	}
+	if d.Platform != "telegram" && d.Platform != "x" {
+		return d, errors.New("unsupported destination platform")
+	}
+	languageSpecified := d.Language != ""
+	if !languageSpecified {
+		d.Language = "ru"
+	}
+	err := s.DB.QueryRow(ctx, `INSERT INTO destinations(platform,external_id,style_prompt,language,mode,daily_post_limit,formatting_enabled,signature_text)
+	 VALUES($1,$2,$3,$4,$5,$6,$7,$8)
 	 ON CONFLICT(platform,external_id) DO UPDATE SET style_prompt=EXCLUDED.style_prompt,mode=EXCLUDED.mode,daily_post_limit=EXCLUDED.daily_post_limit,
-	 formatting_enabled=EXCLUDED.formatting_enabled,signature_text=EXCLUDED.signature_text
-	 RETURNING id`, d.ChatID, d.StylePrompt, d.Mode, d.DailyLimit, d.FormattingEnabled, d.SignatureText).Scan(&d.ID)
+	 formatting_enabled=EXCLUDED.formatting_enabled,signature_text=EXCLUDED.signature_text,
+	 language=CASE WHEN $9 THEN EXCLUDED.language ELSE destinations.language END
+	 RETURNING id,language`, d.Platform, d.ChatID, d.StylePrompt, d.Language, d.Mode, d.DailyLimit, d.FormattingEnabled, d.SignatureText, languageSpecified).Scan(&d.ID, &d.Language)
 	return d, err
 }
 
 func (s *Store) Destinations(ctx context.Context) ([]Destination, error) {
-	rows, err := s.DB.Query(ctx, `SELECT id, external_id, style_prompt, mode, daily_post_limit, formatting_enabled, signature_text FROM destinations ORDER BY id`)
+	rows, err := s.DB.Query(ctx, `SELECT id, platform, external_id, style_prompt, language, mode, daily_post_limit, formatting_enabled, signature_text FROM destinations ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +167,7 @@ func (s *Store) Destinations(ctx context.Context) ([]Destination, error) {
 	var list []Destination
 	for rows.Next() {
 		var d Destination
-		if err := rows.Scan(&d.ID, &d.ChatID, &d.StylePrompt, &d.Mode, &d.DailyLimit, &d.FormattingEnabled, &d.SignatureText); err != nil {
+		if err := rows.Scan(&d.ID, &d.Platform, &d.ChatID, &d.StylePrompt, &d.Language, &d.Mode, &d.DailyLimit, &d.FormattingEnabled, &d.SignatureText); err != nil {
 			return nil, err
 		}
 		list = append(list, d)
@@ -155,7 +181,7 @@ func (s *Store) AddRoute(ctx context.Context, sourceID, destinationID int64) (in
 	return id, err
 }
 func (s *Store) Sources(ctx context.Context) ([]Source, error) {
-	rows, err := s.DB.Query(ctx, `SELECT id,handle,url,cursor FROM sources ORDER BY id`)
+	rows, err := s.DB.Query(ctx, `SELECT id,platform,handle,url,cursor,external_user_id,last_polled_at FROM sources ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +189,7 @@ func (s *Store) Sources(ctx context.Context) ([]Source, error) {
 	var list []Source
 	for rows.Next() {
 		var x Source
-		if err = rows.Scan(&x.ID, &x.Handle, &x.URL, &x.Cursor); err != nil {
+		if err = rows.Scan(&x.ID, &x.Platform, &x.Handle, &x.URL, &x.Cursor, &x.ExternalUserID, &x.LastPolledAt); err != nil {
 			return nil, err
 		}
 		list = append(list, x)
@@ -171,7 +197,7 @@ func (s *Store) Sources(ctx context.Context) ([]Source, error) {
 	return list, rows.Err()
 }
 func (s *Store) Routes(ctx context.Context, sourceID int64) ([]Route, error) {
-	rows, err := s.DB.Query(ctx, `SELECT r.id,r.source_id,d.id,d.external_id,d.style_prompt,d.mode,d.daily_post_limit,d.formatting_enabled,d.signature_text
+	rows, err := s.DB.Query(ctx, `SELECT r.id,r.source_id,d.id,d.platform,d.external_id,d.style_prompt,d.language,d.mode,d.daily_post_limit,d.formatting_enabled,d.signature_text
 	 FROM routes r JOIN destinations d ON d.id=r.destination_id WHERE r.source_id=$1 ORDER BY r.id`, sourceID)
 	if err != nil {
 		return nil, err
@@ -180,7 +206,7 @@ func (s *Store) Routes(ctx context.Context, sourceID int64) ([]Route, error) {
 	var list []Route
 	for rows.Next() {
 		var x Route
-		if err = rows.Scan(&x.ID, &x.SourceID, &x.Destination.ID, &x.Destination.ChatID, &x.Destination.StylePrompt, &x.Destination.Mode, &x.Destination.DailyLimit, &x.Destination.FormattingEnabled, &x.Destination.SignatureText); err != nil {
+		if err = rows.Scan(&x.ID, &x.SourceID, &x.Destination.ID, &x.Destination.Platform, &x.Destination.ChatID, &x.Destination.StylePrompt, &x.Destination.Language, &x.Destination.Mode, &x.Destination.DailyLimit, &x.Destination.FormattingEnabled, &x.Destination.SignatureText); err != nil {
 			return nil, err
 		}
 		list = append(list, x)
@@ -215,6 +241,61 @@ func (s *Store) AddDraft(ctx context.Context, routeID, postID int64, d Destinati
 func (s *Store) SetCursor(ctx context.Context, sourceID, cursor int64) error {
 	_, err := s.DB.Exec(ctx, `UPDATE sources SET cursor=$2 WHERE id=$1 AND CASE WHEN cursor='' THEN true ELSE cursor::bigint < $3 END`, sourceID, strconv.FormatInt(cursor, 10), cursor)
 	return err
+}
+func (s *Store) SetXUserID(ctx context.Context, sourceID int64, userID string) error {
+	_, err := s.DB.Exec(ctx, `UPDATE sources SET external_user_id=$2 WHERE id=$1 AND platform='x'`, sourceID, userID)
+	return err
+}
+func (s *Store) MarkPolled(ctx context.Context, sourceID int64) error {
+	_, err := s.DB.Exec(ctx, `UPDATE sources SET last_polled_at=now() WHERE id=$1`, sourceID)
+	return err
+}
+func (s *Store) XDestination(ctx context.Context, id int64) (Destination, error) {
+	var d Destination
+	err := s.DB.QueryRow(ctx, `SELECT id,platform,external_id FROM destinations WHERE id=$1 AND platform='x'`, id).Scan(&d.ID, &d.Platform, &d.ChatID)
+	return d, err
+}
+func (s *Store) SaveXOAuthRequest(ctx context.Context, destinationID int64, token string, secretCipher []byte) error {
+	_, err := s.DB.Exec(ctx, `DELETE FROM x_oauth_requests WHERE expires_at<now()`)
+	if err != nil {
+		return err
+	}
+	_, err = s.DB.Exec(ctx, `INSERT INTO x_oauth_requests(request_token,destination_id,secret_cipher,expires_at)
+	 VALUES($1,$2,$3,now()+interval '10 minutes')`, token, destinationID, secretCipher)
+	return err
+}
+func (s *Store) XOAuthRequest(ctx context.Context, destinationID int64, token string) ([]byte, error) {
+	var cipher []byte
+	err := s.DB.QueryRow(ctx, `SELECT secret_cipher FROM x_oauth_requests WHERE destination_id=$1 AND request_token=$2 AND expires_at>now()`, destinationID, token).Scan(&cipher)
+	return cipher, err
+}
+func (s *Store) SaveXConnection(ctx context.Context, destinationID int64, username string, tokenCipher, secretCipher []byte, requestToken string) error {
+	tx, err := s.DB.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	_, err = tx.Exec(ctx, `INSERT INTO x_connections(destination_id,username,token_cipher,secret_cipher)
+	 VALUES($1,$2,$3,$4) ON CONFLICT(destination_id) DO UPDATE SET username=EXCLUDED.username,
+	 token_cipher=EXCLUDED.token_cipher,secret_cipher=EXCLUDED.secret_cipher,publish_enabled=true,connected_at=now()`, destinationID, username, tokenCipher, secretCipher)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `DELETE FROM x_oauth_requests WHERE request_token=$1 AND destination_id=$2`, requestToken, destinationID)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+func (s *Store) DisableXPublishing(ctx context.Context, destinationID int64) error {
+	_, err := s.DB.Exec(ctx, `UPDATE x_connections SET publish_enabled=false WHERE destination_id=$1`, destinationID)
+	return err
+}
+func (s *Store) XConnection(ctx context.Context, destinationID int64) (string, []byte, []byte, error) {
+	var username string
+	var tokenCipher, secretCipher []byte
+	err := s.DB.QueryRow(ctx, `SELECT username,token_cipher,secret_cipher FROM x_connections WHERE destination_id=$1`, destinationID).Scan(&username, &tokenCipher, &secretCipher)
+	return username, tokenCipher, secretCipher, err
 }
 func (s *Store) ListDrafts(ctx context.Context, status string) ([]Draft, error) {
 	query := `SELECT d.id,p.original_url,d.destination_id,d.body,d.media_paths,d.status,COALESCE(d.external_post_id,''),COALESCE(d.error,''),d.created_at
@@ -266,10 +347,11 @@ func (s *Store) Approve(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (s *Store) RetryRejectedMembership(ctx context.Context, id int64) error {
+func (s *Store) RetryDefinitiveRejection(ctx context.Context, id int64) error {
 	ct, err := s.DB.Exec(ctx, `UPDATE drafts SET status='ready_to_publish',error=NULL
 	 WHERE id=$1 AND status='publish_failed' AND external_post_id IS NULL
-	 AND error='Telegram API HTTP 403: Forbidden: bot is not a member of the channel chat'`, id)
+	 AND (error='Telegram API HTTP 403: Forbidden: bot is not a member of the channel chat'
+	 OR error='X API HTTP 403: Your client app is not configured with the appropriate oauth1 app permissions for this endpoint.')`, id)
 	if err != nil {
 		return err
 	}
@@ -281,8 +363,13 @@ func (s *Store) RetryRejectedMembership(ctx context.Context, id int64) error {
 
 // ClaimReady serializes quota checks on the destination row. A publishing draft is
 // never automatically retried: the API may have succeeded before a network error.
-func (s *Store) ClaimReady(ctx context.Context) (Draft, Destination, bool, error) {
-	rows, err := s.DB.Query(ctx, `SELECT id,destination_id FROM drafts WHERE status='ready_to_publish' ORDER BY created_at`)
+func (s *Store) ClaimReady(ctx context.Context, allowTelegram, allowX, allowXFallback bool) (Draft, Destination, bool, error) {
+	rows, err := s.DB.Query(ctx, `SELECT dr.id,dr.destination_id FROM drafts dr
+	 JOIN destinations d ON d.id=dr.destination_id
+	 WHERE dr.status='ready_to_publish' AND ((d.platform='telegram' AND $1) OR
+	 (d.platform='x' AND $2 AND (($3 AND NOT EXISTS(SELECT 1 FROM x_connections xc WHERE xc.destination_id=d.id))
+	 OR EXISTS(SELECT 1 FROM x_connections xc WHERE xc.destination_id=d.id AND xc.publish_enabled))))
+	 ORDER BY dr.created_at`, allowTelegram, allowX, allowXFallback)
 	if err != nil {
 		return Draft{}, Destination{}, false, err
 	}
@@ -307,8 +394,8 @@ func (s *Store) ClaimReady(ctx context.Context) (Draft, Destination, bool, error
 			return Draft{}, Destination{}, false, err
 		}
 		var d Destination
-		err = tx.QueryRow(ctx, `SELECT id,external_id,style_prompt,mode,daily_post_limit,formatting_enabled,signature_text FROM destinations WHERE id=$1 FOR UPDATE`, p.dest).
-			Scan(&d.ID, &d.ChatID, &d.StylePrompt, &d.Mode, &d.DailyLimit, &d.FormattingEnabled, &d.SignatureText)
+		err = tx.QueryRow(ctx, `SELECT id,platform,external_id,style_prompt,language,mode,daily_post_limit,formatting_enabled,signature_text FROM destinations WHERE id=$1 FOR UPDATE`, p.dest).
+			Scan(&d.ID, &d.Platform, &d.ChatID, &d.StylePrompt, &d.Language, &d.Mode, &d.DailyLimit, &d.FormattingEnabled, &d.SignatureText)
 		if err != nil {
 			_ = tx.Rollback(ctx)
 			return Draft{}, Destination{}, false, err

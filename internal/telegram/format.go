@@ -22,8 +22,12 @@ func renderPublication(text, chatID string, options PublishOptions) (string, int
 		if err != nil {
 			return "", 0, err
 		}
-		visible += "\n\n" + options.SignatureText
-		formatted += "\n\n<a href=\"https://t.me/" + handle + "\">" + html.EscapeString(options.SignatureText) + "</a>"
+		separator := "\n\n"
+		if strings.TrimSpace(text) == "" {
+			separator = ""
+		}
+		visible += separator + options.SignatureText
+		formatted += separator + "<a href=\"https://t.me/" + handle + "\">" + html.EscapeString(options.SignatureText) + "</a>"
 	}
 	return formatted, utf8.RuneCountInString(visible), nil
 }

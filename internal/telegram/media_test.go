@@ -31,3 +31,21 @@ func TestMediaStoreSavesTelegramImage(t *testing.T) {
 		t.Fatalf("made %d requests", requests)
 	}
 }
+
+func TestMediaStoreSavesMP4AndRejectsOtherHosts(t *testing.T) {
+	video := []byte("0000ftypisomvideo")
+	store := MediaStore{Dir: t.TempDir(), Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(string(video))), Header: make(http.Header)}, nil
+	})}}
+	path, err := store.SaveVideo(context.Background(), "https://video.twimg.com/example.mp4")
+	if err != nil || !strings.HasSuffix(path, ".mp4") {
+		t.Fatalf("path=%q err=%v", path, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != string(video) {
+		t.Fatalf("saved video mismatch: %v", err)
+	}
+	if _, err := store.SaveVideo(context.Background(), "https://evil.example/example.mp4"); err == nil {
+		t.Fatal("accepted external host")
+	}
+}

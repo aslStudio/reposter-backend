@@ -48,6 +48,14 @@ func TestParsePublicPageRetainsChannelLinkForFooterCleanup(t *testing.T) {
 	}
 }
 
+func TestParsePublicPageVideo(t *testing.T) {
+	page := `<div class="tgme_widget_message" data-post="example_channel/43"><div class="tgme_widget_message_video_player"><video class="tgme_widget_message_video" src="https://cdn4.telesco.pe/file/clip.mp4"></video></div></div>`
+	posts, err := ParsePublicPage(strings.NewReader(page), "example_channel")
+	if err != nil || len(posts) != 1 || len(posts[0].VideoURLs) != 1 || posts[0].VideoURLs[0] != "https://cdn4.telesco.pe/file/clip.mp4" {
+		t.Fatalf("posts=%+v err=%v", posts, err)
+	}
+}
+
 func TestReaderPaginatesToCursor(t *testing.T) {
 	requests := 0
 	reader := Reader{Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {

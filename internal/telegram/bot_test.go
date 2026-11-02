@@ -70,3 +70,61 @@ func TestBotPublishesAlbumWithCaption(t *testing.T) {
 		t.Fatalf("id=%s requests=%d err=%v", id, requests, err)
 	}
 }
+
+func TestBotPublishesVideo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clip.mp4")
+	if err := os.WriteFile(path, []byte("video"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	bot := Bot{Token: "test-token", Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(req.URL.Path, "/sendVideo") {
+			t.Errorf("endpoint %s", req.URL.Path)
+		}
+		if err := req.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatal(err)
+		}
+		if req.FormValue("caption") != "Video" || req.FormValue("supports_streaming") != "true" {
+			t.Errorf("form %+v", req.Form)
+		}
+		if _, _, err := req.FormFile("video"); err != nil {
+			t.Error(err)
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"message_id":45}}`)), Header: make(http.Header)}, nil
+	})}}
+	id, err := bot.Publish(context.Background(), "@my_channel", "Video", []string{path}, PublishOptions{})
+	if err != nil || id != "45" {
+		t.Fatalf("id=%s err=%v", id, err)
+	}
+}
+
+func TestBotPublishesMixedAlbum(t *testing.T) {
+	dir := t.TempDir()
+	photo := filepath.Join(dir, "photo.jpg")
+	video := filepath.Join(dir, "clip.mp4")
+	for _, path := range []string{photo, video} {
+		if err := os.WriteFile(path, []byte("content"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bot := Bot{Token: "test-token", Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(req.URL.Path, "/sendMediaGroup") {
+			t.Errorf("endpoint %s", req.URL.Path)
+		}
+		if err := req.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatal(err)
+		}
+		var media []struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(req.FormValue("media")), &media); err != nil {
+			t.Fatal(err)
+		}
+		if len(media) != 2 || media[0].Type != "photo" || media[1].Type != "video" {
+			t.Errorf("media %+v", media)
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":[{"message_id":45},{"message_id":46}]}`)), Header: make(http.Header)}, nil
+	})}}
+	if _, err := bot.Publish(context.Background(), "@my_channel", "", []string{photo, video}, PublishOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}

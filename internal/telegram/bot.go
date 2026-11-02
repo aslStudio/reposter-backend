@@ -47,7 +47,7 @@ func (b Bot) Publish(ctx context.Context, chatID, text string, paths []string, o
 		return "", errors.New("post text exceeds Telegram limit")
 	}
 	if len(paths) > 10 {
-		return "", errors.New("Telegram album exceeds 10 images")
+		return "", errors.New("Telegram album exceeds 10 media items")
 	}
 	if len(paths) == 0 {
 		return b.sendText(ctx, chatID, formatted)
@@ -58,7 +58,11 @@ func (b Bot) Publish(ctx context.Context, chatID, text string, paths []string, o
 	}
 	var id string
 	if len(paths) == 1 {
-		id, err = b.sendPhoto(ctx, chatID, paths[0], caption)
+		if strings.EqualFold(filepath.Ext(paths[0]), ".mp4") {
+			id, err = b.sendVideo(ctx, chatID, paths[0], caption)
+		} else {
+			id, err = b.sendPhoto(ctx, chatID, paths[0], caption)
+		}
 	} else {
 		id, err = b.sendAlbum(ctx, chatID, paths, caption)
 	}
@@ -67,7 +71,7 @@ func (b Bot) Publish(ctx context.Context, chatID, text string, paths []string, o
 	}
 	if caption == "" && formatted != "" {
 		if _, err = b.sendText(ctx, chatID, formatted); err != nil {
-			return id, fmt.Errorf("images published but text failed: %w", err)
+			return id, fmt.Errorf("media published but text failed: %w", err)
 		}
 	}
 	return id, nil
@@ -100,33 +104,79 @@ func (b Bot) sendPhoto(ctx context.Context, chatID, path, caption string) (strin
 	}
 	return firstMessageID(resp.Result)
 }
-func (b Bot) sendAlbum(ctx context.Context, chatID string, paths []string, caption string) (string, error) {
-	var data bytes.Buffer
-	w := multipart.NewWriter(&data)
-	_ = w.WriteField("chat_id", chatID)
-	media := make([]map[string]string, 0, len(paths))
-	for i, path := range paths {
-		name := "file" + strconv.Itoa(i)
-		entry := map[string]string{"type": "photo", "media": "attach://" + name}
-		if i == 0 && caption != "" {
-			entry["caption"] = caption
-			entry["parse_mode"] = "HTML"
+func (b Bot) sendVideo(ctx context.Context, chatID, path, caption string) (string, error) {
+	resp, err := b.callMultipart(ctx, "sendVideo", func(w *multipart.Writer) error {
+		if err := w.WriteField("chat_id", chatID); err != nil {
+			return err
 		}
-		media = append(media, entry)
-		if err := addFile(w, name, path); err != nil {
-			return "", err
+		if err := w.WriteField("supports_streaming", "true"); err != nil {
+			return err
 		}
-	}
-	encoded, _ := json.Marshal(media)
-	_ = w.WriteField("media", string(encoded))
-	if err := w.Close(); err != nil {
-		return "", err
-	}
-	resp, err := b.call(ctx, "sendMediaGroup", w.FormDataContentType(), &data)
+		if caption != "" {
+			if err := w.WriteField("caption", caption); err != nil {
+				return err
+			}
+			if err := w.WriteField("parse_mode", "HTML"); err != nil {
+				return err
+			}
+		}
+		return addFile(w, "video", path)
+	})
 	if err != nil {
 		return "", err
 	}
 	return firstMessageID(resp.Result)
+}
+func (b Bot) sendAlbum(ctx context.Context, chatID string, paths []string, caption string) (string, error) {
+	resp, err := b.callMultipart(ctx, "sendMediaGroup", func(w *multipart.Writer) error {
+		if err := w.WriteField("chat_id", chatID); err != nil {
+			return err
+		}
+		media := make([]map[string]string, 0, len(paths))
+		for i, path := range paths {
+			name := "file" + strconv.Itoa(i)
+			kind := "photo"
+			if strings.EqualFold(filepath.Ext(path), ".mp4") {
+				kind = "video"
+			}
+			entry := map[string]string{"type": kind, "media": "attach://" + name}
+			if i == 0 && caption != "" {
+				entry["caption"], entry["parse_mode"] = caption, "HTML"
+			}
+			media = append(media, entry)
+		}
+		encoded, err := json.Marshal(media)
+		if err != nil {
+			return err
+		}
+		if err := w.WriteField("media", string(encoded)); err != nil {
+			return err
+		}
+		for i, path := range paths {
+			if err := addFile(w, "file"+strconv.Itoa(i), path); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return firstMessageID(resp.Result)
+}
+func (b Bot) callMultipart(ctx context.Context, method string, write func(*multipart.Writer) error) (botResponse, error) {
+	reader, writer := io.Pipe()
+	multipartWriter := multipart.NewWriter(writer)
+	go func() {
+		err := write(multipartWriter)
+		if err == nil {
+			err = multipartWriter.Close()
+		}
+		_ = writer.CloseWithError(err)
+	}()
+	resp, err := b.call(ctx, method, multipartWriter.FormDataContentType(), reader)
+	_ = reader.Close()
+	return resp, err
 }
 func addFile(w *multipart.Writer, field, path string) error {
 	f, err := os.Open(path)
@@ -144,7 +194,7 @@ func addFile(w *multipart.Writer, field, path string) error {
 func (b Bot) call(ctx context.Context, method, contentType string, body io.Reader) (botResponse, error) {
 	client := b.Client
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{Timeout: 2 * time.Minute}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+b.Token+"/"+method, body)
 	if err != nil {

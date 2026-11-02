@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: Reposter local admin API
   version: 0.1.0
-  description: Single-operator API for the first Telegram integration. Not a public multi-user API.
+  description: Single-operator API for Telegram and X. Not a public multi-user API.
 servers:
   - url: http://localhost:8080
 security:
@@ -16,18 +16,21 @@ components:
   schemas:
     Source:
       type: object
-      required: [id, handle, url]
+      required: [id, platform, handle, url]
       properties:
         id: {type: integer, format: int64}
+        platform: {type: string, enum: [telegram, x]}
         handle: {type: string}
         url: {type: string, format: uri}
     Destination:
       type: object
-      required: [id, chat_id, style_prompt, mode, daily_limit, formatting_enabled, signature_text]
+      required: [id, platform, chat_id, style_prompt, language, mode, daily_limit, formatting_enabled, signature_text]
       properties:
         id: {type: integer, format: int64}
-        chat_id: {type: string}
+        platform: {type: string, enum: [telegram, x]}
+        chat_id: {type: string, description: 'Telegram channel ID or @username; X destination @username'}
         style_prompt: {type: string}
+        language: {type: string, description: 'BCP 47 target language tag for rewriting, such as ru, en, or tr'}
         mode: {type: string, enum: [manual_approval, automatic]}
         daily_limit: {type: integer, minimum: 0, maximum: 100, description: '0 disables the daily limit'}
         formatting_enabled: {type: boolean, description: 'Render supported Markdown formatting in Telegram messages'}
@@ -50,6 +53,92 @@ components:
       properties:
         error: {type: string}
 paths:
+  /v1/x/connections/start:
+    post:
+      summary: Begin PIN authorization for an X destination
+      description: Returns a URL to open while signed into the destination X account. The developer app must allow Read and Write and have a callback URL configured, even for PIN authorization.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [destination_id]
+              properties:
+                destination_id: {type: integer, format: int64}
+      responses:
+        '200':
+          description: Authorization URL and short-lived request token
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [authorization_url, request_token]
+                properties:
+                  authorization_url: {type: string, format: uri}
+                  request_token: {type: string}
+        '400': {description: Invalid X destination}
+        '502': {description: X authorization request failed}
+  /v1/x/connections/complete:
+    post:
+      summary: Exchange the X PIN for a destination connection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [destination_id, request_token, pin]
+              properties:
+                destination_id: {type: integer, format: int64}
+                request_token: {type: string}
+                pin: {type: string, description: 'PIN shown by X after authorization'}
+      responses:
+        '200':
+          description: X destination connected; secrets are never returned
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [destination_id, username, status]
+                properties:
+                  destination_id: {type: integer, format: int64}
+                  username: {type: string}
+                  status: {type: string, enum: [connected]}
+        '400': {description: Invalid or expired authorization request}
+        '409': {description: Authorized X account differs from destination}
+        '502': {description: X token exchange or verification failed}
+  /v1/x/destinations/{id}/test-post:
+    post:
+      summary: Publish one explicit test post to a connected X destination
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: integer, format: int64}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: {type: string, minLength: 1, maxLength: 280}
+      responses:
+        '200':
+          description: Test post published
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, url]
+                properties:
+                  id: {type: string}
+                  url: {type: string, format: uri}
+        '400': {description: Invalid destination or text}
+        '409': {description: Destination is not connected}
+        '502': {description: X publication failed}
   /healthz:
     get:
       security: []
@@ -59,7 +148,7 @@ paths:
         '503': {description: Database unavailable}
   /v1/sources:
     get:
-      summary: List public Telegram sources
+      summary: List public Telegram and X sources
       responses:
         '200':
           description: Sources
@@ -67,7 +156,7 @@ paths:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/Source'}}
     post:
-      summary: Add a public Telegram source
+      summary: Add a public Telegram or X source
       description: The first poll records the latest post as a baseline and does not create drafts from old posts.
       requestBody:
         required: true
@@ -77,17 +166,18 @@ paths:
               type: object
               required: [url]
               properties:
-                url: {type: string, example: 'https://t.me/example_channel'}
+                url: {type: string, example: 'https://x.com/FoxNews'}
+                platform: {type: string, enum: [telegram, x], default: telegram}
       responses:
         '201':
           description: Source created or already present
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Source'}
-        '400': {description: Invalid public channel link}
+        '400': {description: Invalid source link or platform}
   /v1/destinations:
     get:
-      summary: List Telegram destinations
+      summary: List Telegram and X destinations
       responses:
         '200':
           description: Destinations
@@ -95,8 +185,8 @@ paths:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/Destination'}}
     post:
-      summary: Add a Telegram channel owned by the operator
-      description: The configured bot must be a channel administrator with permission to post. A non-empty signature_text requires a public @username destination; the link target is derived from chat_id.
+      summary: Add a Telegram channel or X account owned by the operator
+      description: Telegram requires a bot with post permission. X requires a user access token and secret for the configured @username. A non-empty signature_text is only valid for public Telegram destinations.
       requestBody:
         required: true
         content:
@@ -105,22 +195,25 @@ paths:
               type: object
               required: [chat_id, style_prompt, mode, daily_limit]
               properties:
+                platform: {type: string, enum: [telegram, x], default: telegram}
                 chat_id: {type: string, example: '@my_channel'}
                 style_prompt: {type: string, maxLength: 5000}
+                language: {type: string, example: en, description: 'Optional BCP 47 target language tag. Defaults to ru for a new destination; omission preserves the existing language when updating.'}
                 mode: {type: string, enum: [manual_approval, automatic]}
                 daily_limit: {type: integer, minimum: 0, maximum: 100, description: '0 disables the daily limit'}
-                formatting_enabled: {type: boolean, description: 'Render supported Markdown formatting in Telegram messages'}
-                signature_text: {type: string, maxLength: 200, description: 'Optional footer label linked to the public destination channel'}
+                formatting_enabled: {type: boolean, description: 'Telegram only; render supported Markdown formatting'}
+                signature_text: {type: string, maxLength: 200, description: 'Telegram only; footer label linked to destination channel'}
       responses:
         '201':
           description: Destination created
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Destination'}
-        '400': {description: Invalid settings}
+        '400': {description: Invalid settings or unsupported platform options}
   /v1/routes:
     post:
       summary: Route one source to one destination
+      description: Telegram and X sources can each route to Telegram or X destinations. Rewriting uses the destination's style and language; publication follows the destination platform's limits.
       requestBody:
         required: true
         content:
@@ -160,8 +253,8 @@ paths:
         '409': {description: Draft is not awaiting approval}
   /v1/drafts/{id}/retry:
     post:
-      summary: Requeue a draft rejected because the bot was not a channel member
-      description: Only a definitive Telegram 403 rejection with no external post ID can be retried. Other failed outcomes require manual inspection to avoid duplicate posts.
+      summary: Requeue a draft definitively rejected by Telegram or X
+      description: Eligible errors are Telegram 403 bot not a channel member and X 403 OAuth1 app permissions, both with no external post ID. Fix the cause before retrying. Uncertain failures remain ineligible to avoid duplicates.
       parameters:
         - in: path
           name: id
@@ -172,7 +265,7 @@ paths:
         '409': {description: Draft is not eligible for safe retry}
   /v1/drafts/{id}/media/{index}:
     get:
-      summary: Download a saved draft image
+      summary: Download a saved draft image or MP4 video
       parameters:
         - in: path
           name: id
@@ -183,8 +276,8 @@ paths:
           required: true
           schema: {type: integer, minimum: 0}
       responses:
-        '200': {description: Image bytes}
-        '404': {description: Image not found}
+        '200': {description: Image or MP4 video bytes}
+        '404': {description: Media not found}
   /v1/poll:
     post:
       summary: Run a source poll and publication cycle now
