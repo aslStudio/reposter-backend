@@ -16,6 +16,7 @@ import (
 	"reposter/internal/locale"
 	"reposter/internal/store"
 	"reposter/internal/telegram"
+	"reposter/internal/threads"
 	"reposter/internal/x"
 )
 
@@ -23,6 +24,7 @@ type API struct {
 	Store      *store.Store
 	Service    *app.Service
 	AdminToken string
+	Auth       *Authenticator
 }
 
 func (a API) Handler() http.Handler {
@@ -34,11 +36,25 @@ func (a API) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("POST /v1/auth/login", a.login)
+	mux.HandleFunc("GET /v1/auth/me", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
+	})
+	mux.HandleFunc("POST /v1/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		clearSession(w, r)
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("POST /v1/sources", a.addSource)
 	mux.HandleFunc("GET /v1/sources", a.listSources)
+	mux.HandleFunc("PATCH /v1/sources/{id}", a.setSourceEnabled)
+	mux.HandleFunc("GET /v1/settings", a.getSettings)
+	mux.HandleFunc("PATCH /v1/settings", a.updateSettings)
 	mux.HandleFunc("POST /v1/destinations", a.addDestination)
 	mux.HandleFunc("GET /v1/destinations", a.listDestinations)
 	mux.HandleFunc("POST /v1/routes", a.addRoute)
+	mux.HandleFunc("GET /v1/routes", a.listRoutes)
+	mux.HandleFunc("GET /v1/statistics", a.statistics)
 	mux.HandleFunc("GET /v1/drafts", a.listDrafts)
 	mux.HandleFunc("GET /v1/drafts/{id}/media/{index}", a.draftMedia)
 	mux.HandleFunc("POST /v1/drafts/{id}/approve", a.approve)
@@ -48,12 +64,48 @@ func (a API) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/x/connections/complete", a.xConnectionComplete)
 	mux.HandleFunc("POST /v1/x/destinations/{id}/test-post", a.xTestPost)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/healthz" && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Admin-Token")), []byte(a.AdminToken)) != 1 {
-			writeError(w, http.StatusUnauthorized, "invalid admin token")
-			return
+		if r.URL.Path != "/healthz" && r.URL.Path != "/v1/auth/login" {
+			tokenValid := a.AdminToken != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Admin-Token")), []byte(a.AdminToken)) == 1
+			if !tokenValid {
+				if a.Auth == nil || !a.Auth.HasSession(r) {
+					writeError(w, http.StatusUnauthorized, "authentication required")
+					return
+				}
+				if r.Method != http.MethodGet && r.Method != http.MethodHead && !sameOrigin(r) {
+					writeError(w, http.StatusForbidden, "same-origin request required")
+					return
+				}
+			}
 		}
 		mux.ServeHTTP(w, r)
 	})
+}
+
+func (a API) login(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if a.Auth == nil {
+		writeError(w, http.StatusNotFound, "password login is not configured")
+		return
+	}
+	if !sameOrigin(r) {
+		writeError(w, http.StatusForbidden, "same-origin request required")
+		return
+	}
+	var body struct {
+		Password string `json:"password"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if !a.Auth.CheckPassword(body.Password) {
+		writeError(w, http.StatusUnauthorized, "invalid password")
+		return
+	}
+	if err := a.Auth.IssueSession(w, r); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create session")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
 }
 func (a API) xConnectionStart(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -167,6 +219,8 @@ func (a API) addSource(w http.ResponseWriter, r *http.Request) {
 		handle, err = telegram.ParseHandle(body.URL)
 	case "x":
 		handle, err = x.ParseHandle(body.URL)
+	case "threads":
+		handle, err = threads.ParseHandle(body.URL)
 	default:
 		writeError(w, 400, "unsupported source platform")
 		return
@@ -193,6 +247,59 @@ func (a API) listSources(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, list)
 }
+func (a API) setSourceEnabled(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id < 1 {
+		writeError(w, http.StatusBadRequest, "invalid source id")
+		return
+	}
+	var body struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if body.Enabled == nil {
+		writeError(w, http.StatusBadRequest, "enabled is required")
+		return
+	}
+	source, err := a.Store.SetSourceEnabled(r.Context(), id, *body.Enabled)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "source not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not update source")
+		return
+	}
+	writeJSON(w, http.StatusOK, source)
+}
+func (a API) getSettings(w http.ResponseWriter, r *http.Request) {
+	enabled, err := a.Store.AutomationEnabled(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load settings")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"automation_enabled": enabled})
+}
+func (a API) updateSettings(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		AutomationEnabled *bool `json:"automation_enabled"`
+	}
+	if !decode(w, r, &body) {
+		return
+	}
+	if body.AutomationEnabled == nil {
+		writeError(w, http.StatusBadRequest, "automation_enabled is required")
+		return
+	}
+	enabled, err := a.Store.SetAutomationEnabled(r.Context(), *body.AutomationEnabled)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not update settings")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"automation_enabled": enabled})
+}
 func (a API) addDestination(w http.ResponseWriter, r *http.Request) {
 	var body store.Destination
 	if !decode(w, r, &body) {
@@ -210,14 +317,15 @@ func (a API) addDestination(w http.ResponseWriter, r *http.Request) {
 	if body.Platform == "" {
 		body.Platform = "telegram"
 	}
-	if (body.Platform != "telegram" && body.Platform != "x") ||
+	if (body.Platform != "telegram" && body.Platform != "x" && body.Platform != "threads") ||
 		(body.Platform == "telegram" && !validChatID(body.ChatID)) ||
 		(body.Platform == "x" && !validXDestination(body.ChatID)) ||
+		(body.Platform == "threads" && !validThreadsDestination(body.ChatID)) ||
 		strings.TrimSpace(body.StylePrompt) == "" || len(body.StylePrompt) > 5000 ||
 		(body.Mode != "manual_approval" && body.Mode != "automatic") || body.DailyLimit < 0 || body.DailyLimit > 100 ||
 		utf8.RuneCountInString(body.SignatureText) > 200 || strings.ContainsAny(body.SignatureText, "\r\n") ||
 		(body.SignatureText != "" && (body.Platform != "telegram" || !strings.HasPrefix(body.ChatID, "@"))) ||
-		(body.Platform == "x" && body.FormattingEnabled) {
+		(body.Platform != "telegram" && body.FormattingEnabled) {
 		writeError(w, 400, "invalid chat_id, style_prompt, mode, daily_limit, or signature_text")
 		return
 	}
@@ -227,6 +335,13 @@ func (a API) addDestination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, d)
+}
+func validThreadsDestination(id string) bool {
+	if !strings.HasPrefix(id, "@") {
+		return false
+	}
+	handle, err := threads.ParseHandle(id)
+	return err == nil && "@"+handle == strings.ToLower(id)
 }
 func validXDestination(id string) bool {
 	if !strings.HasPrefix(id, "@") {
@@ -276,6 +391,28 @@ func (a API) addRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 201, map[string]int64{"id": id})
+}
+func (a API) listRoutes(w http.ResponseWriter, r *http.Request) {
+	list, err := a.Store.AllRoutes(r.Context())
+	if err != nil {
+		writeError(w, 500, "could not list routes")
+		return
+	}
+	if list == nil {
+		list = []store.RouteLink{}
+	}
+	writeJSON(w, 200, list)
+}
+func (a API) statistics(w http.ResponseWriter, r *http.Request) {
+	list, err := a.Store.DestinationStatistics(r.Context())
+	if err != nil {
+		writeError(w, 500, "could not load statistics")
+		return
+	}
+	if list == nil {
+		list = []store.DestinationStatistic{}
+	}
+	writeJSON(w, 200, list)
 }
 func (a API) listDrafts(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
@@ -342,7 +479,16 @@ func (a API) retry(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ready_to_publish"})
 }
 func (a API) poll(w http.ResponseWriter, r *http.Request) {
-	if err := a.Service.Poll(r.Context()); err != nil {
+	enabled, err := a.Store.AutomationEnabled(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load settings")
+		return
+	}
+	if !enabled {
+		writeError(w, http.StatusConflict, "automation is paused")
+		return
+	}
+	if err := a.Service.PollNow(r.Context()); err != nil {
 		writeError(w, 502, "source polling failed; check server logs")
 		return
 	}

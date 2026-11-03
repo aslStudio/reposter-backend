@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reposter</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Reposter</h1>
+    <form id="login" hidden>
+      <label for="password">Пароль</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Войти</button>
+    </form>
+    <section id="signed-in" hidden>
+      <h2>Автоматическая обработка</h2>
+      <label class="switch"><input id="automation" type="checkbox"> Читать источники и публиковать готовые черновики</label>
+      <p class="hint">Новые источники выключены. Включи нужные источники, затем общую обработку.</p>
+      <h2>Источники</h2>
+      <ul id="sources"></ul>
+      <button id="logout" type="button">Выйти</button>
+    </section>
+    <p id="message" role="status"></p>
+  </main>
+</body>
+</html>

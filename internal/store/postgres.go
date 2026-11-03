@@ -80,6 +80,7 @@ type Source struct {
 	Platform       string     `json:"platform"`
 	Handle         string     `json:"handle"`
 	URL            string     `json:"url"`
+	Enabled        bool       `json:"enabled"`
 	Cursor         string     `json:"-"`
 	ExternalUserID string     `json:"-"`
 	LastPolledAt   *time.Time `json:"-"`
@@ -100,25 +101,43 @@ type Route struct {
 	SourceID    int64
 	Destination Destination
 }
+type RouteLink struct {
+	ID            int64 `json:"id"`
+	SourceID      int64 `json:"source_id"`
+	DestinationID int64 `json:"destination_id"`
+}
+type DestinationStatistic struct {
+	DestinationID   int64 `json:"destination_id"`
+	Total           int64 `json:"total"`
+	Pending         int64 `json:"pending"`
+	Ready           int64 `json:"ready"`
+	Published       int64 `json:"published"`
+	Failed          int64 `json:"failed"`
+	PublishedToday  int64 `json:"published_today"`
+	XConnected      bool  `json:"x_connected"`
+	XPublishEnabled bool  `json:"x_publish_enabled"`
+}
 type Post struct {
-	ID          int64
-	ExternalID  string
-	URL         string
-	Text        string
-	MediaPaths  []string
-	PublishedAt time.Time
+	ID              int64
+	ExternalID      string
+	URL             string
+	Text            string
+	MediaPaths      []string
+	MediaSourceURLs []string
+	PublishedAt     time.Time
 }
 type Draft struct {
-	ID             int64     `json:"id"`
-	SourceURL      string    `json:"source_url"`
-	DestinationID  int64     `json:"destination_id"`
-	Body           string    `json:"body"`
-	MediaPaths     []string  `json:"-"`
-	MediaURLs      []string  `json:"media_urls"`
-	Status         string    `json:"status"`
-	ExternalPostID string    `json:"external_post_id,omitempty"`
-	Error          string    `json:"error,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID              int64     `json:"id"`
+	SourceURL       string    `json:"source_url"`
+	DestinationID   int64     `json:"destination_id"`
+	Body            string    `json:"body"`
+	MediaPaths      []string  `json:"-"`
+	MediaSourceURLs []string  `json:"-"`
+	MediaURLs       []string  `json:"media_urls"`
+	Status          string    `json:"status"`
+	ExternalPostID  string    `json:"external_post_id,omitempty"`
+	Error           string    `json:"error,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 func (s *Store) AddSource(ctx context.Context, handle string) (Source, error) {
@@ -126,23 +145,25 @@ func (s *Store) AddSource(ctx context.Context, handle string) (Source, error) {
 }
 func (s *Store) AddPlatformSource(ctx context.Context, platform, handle string) (Source, error) {
 	var out Source
-	if platform != "telegram" && platform != "x" {
+	if platform != "telegram" && platform != "x" && platform != "threads" {
 		return out, errors.New("unsupported source platform")
 	}
 	url := "https://t.me/s/" + handle
 	if platform == "x" {
 		url = "https://x.com/" + handle
+	} else if platform == "threads" {
+		url = "https://www.threads.com/@" + handle
 	}
 	err := s.DB.QueryRow(ctx, `INSERT INTO sources(platform, handle, url) VALUES($1,$2,$3)
 	 ON CONFLICT(platform,handle) DO UPDATE SET handle=EXCLUDED.handle
-	 RETURNING id,platform,handle,url,cursor,external_user_id,last_polled_at`, platform, handle, url).Scan(&out.ID, &out.Platform, &out.Handle, &out.URL, &out.Cursor, &out.ExternalUserID, &out.LastPolledAt)
+	 RETURNING id,platform,handle,url,enabled,cursor,external_user_id,last_polled_at`, platform, handle, url).Scan(&out.ID, &out.Platform, &out.Handle, &out.URL, &out.Enabled, &out.Cursor, &out.ExternalUserID, &out.LastPolledAt)
 	return out, err
 }
 func (s *Store) AddDestination(ctx context.Context, d Destination) (Destination, error) {
 	if d.Platform == "" {
 		d.Platform = "telegram"
 	}
-	if d.Platform != "telegram" && d.Platform != "x" {
+	if d.Platform != "telegram" && d.Platform != "x" && d.Platform != "threads" {
 		return d, errors.New("unsupported destination platform")
 	}
 	languageSpecified := d.Language != ""
@@ -180,8 +201,51 @@ func (s *Store) AddRoute(ctx context.Context, sourceID, destinationID int64) (in
 	 ON CONFLICT(source_id,destination_id) DO UPDATE SET source_id=EXCLUDED.source_id RETURNING id`, sourceID, destinationID).Scan(&id)
 	return id, err
 }
+func (s *Store) AllRoutes(ctx context.Context) ([]RouteLink, error) {
+	rows, err := s.DB.Query(ctx, `SELECT id,source_id,destination_id FROM routes ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []RouteLink
+	for rows.Next() {
+		var item RouteLink
+		if err := rows.Scan(&item.ID, &item.SourceID, &item.DestinationID); err != nil {
+			return nil, err
+		}
+		list = append(list, item)
+	}
+	return list, rows.Err()
+}
+func (s *Store) DestinationStatistics(ctx context.Context) ([]DestinationStatistic, error) {
+	rows, err := s.DB.Query(ctx, `SELECT d.id,
+	 COUNT(dr.id),
+	 COUNT(dr.id) FILTER (WHERE dr.status='pending_approval'),
+	 COUNT(dr.id) FILTER (WHERE dr.status='ready_to_publish'),
+	 COUNT(dr.id) FILTER (WHERE dr.status='published'),
+	 COUNT(dr.id) FILTER (WHERE dr.status='publish_failed'),
+	 COUNT(dr.id) FILTER (WHERE dr.status='published' AND dr.published_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'),
+	 COALESCE(bool_or(xc.destination_id IS NOT NULL), false),
+	 COALESCE(bool_or(xc.publish_enabled), false)
+	 FROM destinations d LEFT JOIN drafts dr ON dr.destination_id=d.id
+	 LEFT JOIN x_connections xc ON xc.destination_id=d.id
+	 GROUP BY d.id ORDER BY d.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []DestinationStatistic
+	for rows.Next() {
+		var item DestinationStatistic
+		if err := rows.Scan(&item.DestinationID, &item.Total, &item.Pending, &item.Ready, &item.Published, &item.Failed, &item.PublishedToday, &item.XConnected, &item.XPublishEnabled); err != nil {
+			return nil, err
+		}
+		list = append(list, item)
+	}
+	return list, rows.Err()
+}
 func (s *Store) Sources(ctx context.Context) ([]Source, error) {
-	rows, err := s.DB.Query(ctx, `SELECT id,platform,handle,url,cursor,external_user_id,last_polled_at FROM sources ORDER BY id`)
+	rows, err := s.DB.Query(ctx, `SELECT id,platform,handle,url,enabled,cursor,external_user_id,last_polled_at FROM sources ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -189,12 +253,28 @@ func (s *Store) Sources(ctx context.Context) ([]Source, error) {
 	var list []Source
 	for rows.Next() {
 		var x Source
-		if err = rows.Scan(&x.ID, &x.Platform, &x.Handle, &x.URL, &x.Cursor, &x.ExternalUserID, &x.LastPolledAt); err != nil {
+		if err = rows.Scan(&x.ID, &x.Platform, &x.Handle, &x.URL, &x.Enabled, &x.Cursor, &x.ExternalUserID, &x.LastPolledAt); err != nil {
 			return nil, err
 		}
 		list = append(list, x)
 	}
 	return list, rows.Err()
+}
+func (s *Store) SetSourceEnabled(ctx context.Context, id int64, enabled bool) (Source, error) {
+	var out Source
+	err := s.DB.QueryRow(ctx, `UPDATE sources SET enabled=$2 WHERE id=$1
+	 RETURNING id,platform,handle,url,enabled,cursor,external_user_id,last_polled_at`, id, enabled).
+		Scan(&out.ID, &out.Platform, &out.Handle, &out.URL, &out.Enabled, &out.Cursor, &out.ExternalUserID, &out.LastPolledAt)
+	return out, err
+}
+func (s *Store) AutomationEnabled(ctx context.Context) (bool, error) {
+	var enabled bool
+	err := s.DB.QueryRow(ctx, `SELECT automation_enabled FROM operator_settings WHERE id=true`).Scan(&enabled)
+	return enabled, err
+}
+func (s *Store) SetAutomationEnabled(ctx context.Context, enabled bool) (bool, error) {
+	err := s.DB.QueryRow(ctx, `UPDATE operator_settings SET automation_enabled=$1 WHERE id=true RETURNING automation_enabled`, enabled).Scan(&enabled)
+	return enabled, err
 }
 func (s *Store) Routes(ctx context.Context, sourceID int64) ([]Route, error) {
 	rows, err := s.DB.Query(ctx, `SELECT r.id,r.source_id,d.id,d.platform,d.external_id,d.style_prompt,d.language,d.mode,d.daily_post_limit,d.formatting_enabled,d.signature_text
@@ -219,9 +299,9 @@ func (s *Store) SavePost(ctx context.Context, sourceID int64, p Post) (int64, er
 	if !p.PublishedAt.IsZero() {
 		publishedAt = p.PublishedAt
 	}
-	err := s.DB.QueryRow(ctx, `INSERT INTO source_posts(source_id,external_id,original_url,body,media_paths,published_at)
-	 VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(source_id,external_id) DO UPDATE SET external_id=EXCLUDED.external_id RETURNING id`,
-		sourceID, p.ExternalID, p.URL, p.Text, p.MediaPaths, publishedAt).Scan(&id)
+	err := s.DB.QueryRow(ctx, `INSERT INTO source_posts(source_id,external_id,original_url,body,media_paths,media_source_urls,published_at)
+	 VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(source_id,external_id) DO UPDATE SET external_id=EXCLUDED.external_id RETURNING id`,
+		sourceID, p.ExternalID, p.URL, p.Text, p.MediaPaths, p.MediaSourceURLs, publishedAt).Scan(&id)
 	return id, err
 }
 func (s *Store) HasDraft(ctx context.Context, routeID, postID int64) (bool, error) {
@@ -229,13 +309,13 @@ func (s *Store) HasDraft(ctx context.Context, routeID, postID int64) (bool, erro
 	err := s.DB.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM drafts WHERE route_id=$1 AND source_post_id=$2)`, routeID, postID).Scan(&exists)
 	return exists, err
 }
-func (s *Store) AddDraft(ctx context.Context, routeID, postID int64, d Destination, body string, media []string) error {
+func (s *Store) AddDraft(ctx context.Context, routeID, postID int64, d Destination, body string, media, mediaSourceURLs []string) error {
 	status := "pending_approval"
 	if d.Mode == "automatic" {
 		status = "ready_to_publish"
 	}
-	_, err := s.DB.Exec(ctx, `INSERT INTO drafts(route_id,source_post_id,destination_id,body,media_paths,status)
-	 VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(route_id,source_post_id) DO NOTHING`, routeID, postID, d.ID, body, media, status)
+	_, err := s.DB.Exec(ctx, `INSERT INTO drafts(route_id,source_post_id,destination_id,body,media_paths,media_source_urls,status)
+	 VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(route_id,source_post_id) DO NOTHING`, routeID, postID, d.ID, body, media, mediaSourceURLs, status)
 	return err
 }
 func (s *Store) SetCursor(ctx context.Context, sourceID, cursor int64) error {
@@ -363,13 +443,16 @@ func (s *Store) RetryDefinitiveRejection(ctx context.Context, id int64) error {
 
 // ClaimReady serializes quota checks on the destination row. A publishing draft is
 // never automatically retried: the API may have succeeded before a network error.
-func (s *Store) ClaimReady(ctx context.Context, allowTelegram, allowX, allowXFallback bool) (Draft, Destination, bool, error) {
+func (s *Store) ClaimReady(ctx context.Context, allowTelegram, allowX, allowXFallback, allowThreads bool) (Draft, Destination, bool, error) {
 	rows, err := s.DB.Query(ctx, `SELECT dr.id,dr.destination_id FROM drafts dr
 	 JOIN destinations d ON d.id=dr.destination_id
-	 WHERE dr.status='ready_to_publish' AND ((d.platform='telegram' AND $1) OR
+	 JOIN routes r ON r.id=dr.route_id
+	 JOIN sources s ON s.id=r.source_id
+	 WHERE dr.status='ready_to_publish' AND s.enabled AND ((d.platform='telegram' AND $1) OR
 	 (d.platform='x' AND $2 AND (($3 AND NOT EXISTS(SELECT 1 FROM x_connections xc WHERE xc.destination_id=d.id))
-	 OR EXISTS(SELECT 1 FROM x_connections xc WHERE xc.destination_id=d.id AND xc.publish_enabled))))
-	 ORDER BY dr.created_at`, allowTelegram, allowX, allowXFallback)
+	 OR EXISTS(SELECT 1 FROM x_connections xc WHERE xc.destination_id=d.id AND xc.publish_enabled))) OR
+	 (d.platform='threads' AND $4))
+	 ORDER BY dr.created_at`, allowTelegram, allowX, allowXFallback, allowThreads)
 	if err != nil {
 		return Draft{}, Destination{}, false, err
 	}
@@ -415,7 +498,7 @@ func (s *Store) ClaimReady(ctx context.Context, allowTelegram, allowX, allowXFal
 		}
 		var draft Draft
 		err = tx.QueryRow(ctx, `UPDATE drafts SET status='publishing' WHERE id=$1 AND status='ready_to_publish'
-		 RETURNING id,body,media_paths,status,created_at`, p.id).Scan(&draft.ID, &draft.Body, &draft.MediaPaths, &draft.Status, &draft.CreatedAt)
+		 RETURNING id,body,media_paths,media_source_urls,status,created_at`, p.id).Scan(&draft.ID, &draft.Body, &draft.MediaPaths, &draft.MediaSourceURLs, &draft.Status, &draft.CreatedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			_ = tx.Rollback(ctx)
 			continue

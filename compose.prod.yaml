@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: reposter
+      POSTGRES_USER: reposter
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reposter -d reposter"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://reposter:${POSTGRES_PASSWORD}@postgres:5432/reposter?sslmode=disable
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
+      PANEL_PASSWORD: ${PANEL_PASSWORD:?set PANEL_PASSWORD in .env}
+      PANEL_SESSION_KEY: ${PANEL_SESSION_KEY:?set PANEL_SESSION_KEY in .env}
+      PANEL_AUTH_REQUIRED: "true"
+      ACTIVE_PLATFORMS: telegram,x
+      BOOTSTRAP_TG_SOURCE: ""
+      BOOTSTRAP_TG_DESTINATION: ""
+      BOOTSTRAP_X_SOURCES: ""
+      BOOTSTRAP_X_DESTINATION: ""
+      BOOTSTRAP_THREADS_SOURCE: ""
+      BOOTSTRAP_THREADS_DESTINATION: ""
+      THREADS_APP_ID: ""
+      THREADS_APP_SECRET: ""
+      THREADS_ACCESS_TOKEN: ""
+      THREADS_SOURCE_MODE: api
+      THREADS_SOURCE_COOKIE: ""
+      HTTP_ADDR: :8080
+      MEDIA_DIR: /data/media
+    volumes:
+      - media_data:/data/media
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?set APP_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../reposter-frontend/dist:/srv:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  postgres_data:
+  media_data:
+  caddy_data:
+  caddy_config:

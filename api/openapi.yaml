@@ -1,40 +1,67 @@
 openapi: 3.0.3
 info:
-  title: Reposter local admin API
+  title: Reposter operator API
   version: 0.1.0
-  description: Single-operator API for Telegram and X. Not a public multi-user API.
+  description: Single-operator API for Telegram, X, and Threads. Server deployment enables Telegram and X; Threads is paused.
 servers:
   - url: http://localhost:8080
+  - url: https://your-domain.example
 security:
   - AdminToken: []
+  - SessionCookie: []
 components:
   securitySchemes:
     AdminToken:
       type: apiKey
       in: header
       name: X-Admin-Token
+    SessionCookie:
+      type: apiKey
+      in: cookie
+      name: reposter_session
   schemas:
     Source:
       type: object
-      required: [id, platform, handle, url]
+      required: [id, platform, handle, url, enabled]
       properties:
         id: {type: integer, format: int64}
-        platform: {type: string, enum: [telegram, x]}
+        platform: {type: string, enum: [telegram, x, threads]}
         handle: {type: string}
         url: {type: string, format: uri}
+        enabled: {type: boolean, description: 'New and migrated sources start disabled; enable explicitly after configuring a route.'}
     Destination:
       type: object
       required: [id, platform, chat_id, style_prompt, language, mode, daily_limit, formatting_enabled, signature_text]
       properties:
         id: {type: integer, format: int64}
-        platform: {type: string, enum: [telegram, x]}
-        chat_id: {type: string, description: 'Telegram channel ID or @username; X destination @username'}
+        platform: {type: string, enum: [telegram, x, threads]}
+        chat_id: {type: string, description: 'Telegram channel ID or @username; X and Threads destination @username'}
         style_prompt: {type: string}
         language: {type: string, description: 'BCP 47 target language tag for rewriting, such as ru, en, or tr'}
         mode: {type: string, enum: [manual_approval, automatic]}
         daily_limit: {type: integer, minimum: 0, maximum: 100, description: '0 disables the daily limit'}
         formatting_enabled: {type: boolean, description: 'Render supported Markdown formatting in Telegram messages'}
         signature_text: {type: string, maxLength: 200, description: 'Optional footer label linked to the public destination channel; empty disables the footer'}
+    RouteLink:
+      type: object
+      required: [id, source_id, destination_id]
+      properties:
+        id: {type: integer, format: int64}
+        source_id: {type: integer, format: int64}
+        destination_id: {type: integer, format: int64}
+    DestinationStatistic:
+      type: object
+      required: [destination_id, total, pending, ready, published, failed, published_today, x_connected, x_publish_enabled]
+      properties:
+        destination_id: {type: integer, format: int64}
+        total: {type: integer, format: int64}
+        pending: {type: integer, format: int64}
+        ready: {type: integer, format: int64}
+        published: {type: integer, format: int64}
+        failed: {type: integer, format: int64}
+        published_today: {type: integer, format: int64, description: 'UTC calendar day'}
+        x_connected: {type: boolean}
+        x_publish_enabled: {type: boolean}
     Draft:
       type: object
       required: [id, source_url, destination_id, body, media_urls, status, created_at]
@@ -53,6 +80,44 @@ components:
       properties:
         error: {type: string}
 paths:
+  /healthz:
+    get:
+      security: []
+      summary: Internal health check
+      responses:
+        '200': {description: Database is reachable}
+        '503': {description: Database is unavailable}
+  /v1/auth/login:
+    post:
+      security: []
+      summary: Start a browser session with the operator password
+      description: Requires an Origin header matching the request host and scheme. The session cookie is HttpOnly, SameSite=Strict, and Secure over HTTPS.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: {type: string, format: password}
+      responses:
+        '200': {description: Authenticated; session cookie set}
+        '401': {description: Incorrect password}
+        '403': {description: Origin mismatch}
+  /v1/auth/me:
+    get:
+      summary: Check the current session
+      responses:
+        '200': {description: Authenticated}
+        '401': {description: Authentication required}
+  /v1/auth/logout:
+    post:
+      summary: Clear the browser session cookie
+      description: Cookie-authenticated writes require a same-origin Origin header.
+      responses:
+        '204': {description: Browser session cleared}
+        '401': {description: Authentication required}
   /v1/x/connections/start:
     post:
       summary: Begin PIN authorization for an X destination
@@ -148,7 +213,7 @@ paths:
         '503': {description: Database unavailable}
   /v1/sources:
     get:
-      summary: List public Telegram and X sources
+      summary: List public Telegram, X, and Threads sources
       responses:
         '200':
           description: Sources
@@ -156,8 +221,8 @@ paths:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/Source'}}
     post:
-      summary: Add a public Telegram or X source
-      description: The first poll records the latest post as a baseline and does not create drafts from old posts.
+      summary: Add a public Telegram, X, or Threads source
+      description: New sources are disabled until PATCH /v1/sources/{id} enables them. The first poll records a baseline for Telegram and X. A Threads source processes exactly its latest visible post on the first poll, then only new posts.
       requestBody:
         required: true
         content:
@@ -166,8 +231,8 @@ paths:
               type: object
               required: [url]
               properties:
-                url: {type: string, example: 'https://x.com/FoxNews'}
-                platform: {type: string, enum: [telegram, x], default: telegram}
+                url: {type: string, example: 'https://www.threads.com/@example_source'}
+                platform: {type: string, enum: [telegram, x, threads], default: telegram}
       responses:
         '201':
           description: Source created or already present
@@ -175,9 +240,62 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Source'}
         '400': {description: Invalid source link or platform}
+  /v1/sources/{id}:
+    patch:
+      summary: Enable or pause parsing of one source
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: integer, format: int64}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: {type: boolean}
+      responses:
+        '200':
+          description: Updated source
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Source'}
+        '400': {description: Invalid source ID or body}
+        '404': {description: Source not found}
+  /v1/settings:
+    get:
+      summary: Read the global automation switch
+      responses:
+        '200':
+          description: Current settings
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [automation_enabled]
+                properties:
+                  automation_enabled: {type: boolean}
+    patch:
+      summary: Enable or pause automatic polling and publication
+      description: Starts false on a new database and after the migration. A paused service does not poll sources or publish queued drafts, including when POST /v1/poll is called.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [automation_enabled]
+              properties:
+                automation_enabled: {type: boolean}
+      responses:
+        '200': {description: Updated settings}
+        '400': {description: Missing or invalid automation_enabled}
   /v1/destinations:
     get:
-      summary: List Telegram and X destinations
+      summary: List Telegram, X, and Threads destinations
       responses:
         '200':
           description: Destinations
@@ -185,8 +303,8 @@ paths:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/Destination'}}
     post:
-      summary: Add a Telegram channel or X account owned by the operator
-      description: Telegram requires a bot with post permission. X requires a user access token and secret for the configured @username. A non-empty signature_text is only valid for public Telegram destinations.
+      summary: Add a Telegram channel, X account, or Threads profile owned by the operator
+      description: Telegram requires a bot with post permission. X requires a connected user token. Threads uses THREADS_ACCESS_TOKEN and verifies its username before publication. A non-empty signature_text is only valid for public Telegram destinations.
       requestBody:
         required: true
         content:
@@ -195,7 +313,7 @@ paths:
               type: object
               required: [chat_id, style_prompt, mode, daily_limit]
               properties:
-                platform: {type: string, enum: [telegram, x], default: telegram}
+                platform: {type: string, enum: [telegram, x, threads], default: telegram}
                 chat_id: {type: string, example: '@my_channel'}
                 style_prompt: {type: string, maxLength: 5000}
                 language: {type: string, example: en, description: 'Optional BCP 47 target language tag. Defaults to ru for a new destination; omission preserves the existing language when updating.'}
@@ -211,9 +329,17 @@ paths:
               schema: {$ref: '#/components/schemas/Destination'}
         '400': {description: Invalid settings or unsupported platform options}
   /v1/routes:
+    get:
+      summary: List source-to-destination links
+      responses:
+        '200':
+          description: Route links
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/RouteLink'}}
     post:
       summary: Route one source to one destination
-      description: Telegram and X sources can each route to Telegram or X destinations. Rewriting uses the destination's style and language; publication follows the destination platform's limits.
+      description: Telegram, X, and Threads sources can route to any supported destination. Rewriting uses the destination's style and language; publication follows the destination platform's limits.
       requestBody:
         required: true
         content:
@@ -227,6 +353,16 @@ paths:
       responses:
         '201': {description: Route created or already present}
         '400': {description: Invalid or missing source or destination}
+  /v1/statistics:
+    get:
+      summary: Aggregate all-time draft counts by destination
+      description: Published-today uses the UTC calendar day. X connection flags are included without exposing tokens.
+      responses:
+        '200':
+          description: One aggregate row per destination
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/DestinationStatistic'}}
   /v1/drafts:
     get:
       summary: List the latest 100 drafts
@@ -283,4 +419,5 @@ paths:
       summary: Run a source poll and publication cycle now
       responses:
         '200': {description: Cycle complete}
+        '409': {description: Automation is paused}
         '502': {description: A source or publication failed; inspect logs and drafts}

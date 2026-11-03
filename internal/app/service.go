@@ -13,6 +13,7 @@ import (
 
 	"reposter/internal/store"
 	"reposter/internal/telegram"
+	"reposter/internal/threads"
 	"reposter/internal/x"
 )
 
@@ -20,35 +21,74 @@ type Rewriter interface {
 	Rewrite(ctx context.Context, sourceText, style, language string) (string, error)
 }
 
+type ThreadsSourceReader interface {
+	ReadSince(ctx context.Context, handle string, afterID int64) ([]telegram.PublicPost, error)
+}
+
 type Service struct {
 	Store                   *store.Store
 	Reader                  telegram.Reader
 	X                       x.Client
+	Threads                 threads.Client
+	ThreadsSource           ThreadsSourceReader
 	XTokenCipher            x.TokenCipher
 	Media                   telegram.MediaStore
 	Rewriter                Rewriter
 	Bot                     telegram.Bot
 	Logger                  *slog.Logger
 	ReplayLatestOnFirstPoll bool
+	EnabledPlatforms        map[string]bool
+}
+
+func (s *Service) platformEnabled(platform string) bool {
+	return s.EnabledPlatforms == nil || s.EnabledPlatforms[platform]
 }
 
 func (s *Service) Poll(ctx context.Context) error {
+	return s.poll(ctx, false)
+}
+
+func (s *Service) PollNow(ctx context.Context) error {
+	return s.poll(ctx, true)
+}
+
+func (s *Service) poll(ctx context.Context, bypassInterval bool) error {
+	if enabled, err := s.Store.AutomationEnabled(ctx); err != nil {
+		return err
+	} else if !enabled {
+		return nil
+	}
 	sources, err := s.Store.Sources(ctx)
 	if err != nil {
 		return err
 	}
 	var failures []error
 	for _, source := range sources {
-		if source.Platform == "x" && source.LastPolledAt != nil && time.Since(*source.LastPolledAt) < 5*time.Minute {
+		if enabled, err := s.Store.AutomationEnabled(ctx); err != nil {
+			return err
+		} else if !enabled {
+			break
+		}
+		if !source.Enabled || !s.platformEnabled(source.Platform) {
 			continue
 		}
-		if err = s.pollSource(ctx, source); err != nil {
-			s.Logger.Error("source poll failed", "source_id", source.ID, "error", err)
-			failures = append(failures, fmt.Errorf("source %d: %w", source.ID, err))
-		} else if source.Platform == "x" {
+		if !bypassInterval && (source.Platform == "x" || source.Platform == "threads") && source.LastPolledAt != nil && time.Since(*source.LastPolledAt) < 5*time.Minute {
+			continue
+		}
+		s.Logger.Info("source poll started", "source_id", source.ID, "platform", source.Platform, "handle", source.Handle)
+		pollErr := s.pollSource(ctx, source)
+		// A failed Threads request still counts as a polling attempt. Keep its
+		// cursor unchanged, but wait before retrying permission and API errors.
+		if source.Platform == "threads" || (source.Platform == "x" && pollErr == nil) {
 			if err = s.Store.MarkPolled(ctx, source.ID); err != nil {
 				return err
 			}
+		}
+		if pollErr != nil {
+			s.Logger.Error("source poll failed", "source_id", source.ID, "error", pollErr)
+			failures = append(failures, fmt.Errorf("source %d: %w", source.ID, pollErr))
+		} else {
+			s.Logger.Info("source poll completed", "source_id", source.ID)
 		}
 	}
 	return errors.Join(failures...)
@@ -79,6 +119,12 @@ func (s *Service) pollSource(ctx context.Context, source store.Source) error {
 			}
 		}
 		posts, err = s.X.ReadSince(ctx, source.Handle, userID, lastPostID)
+	case "threads":
+		if s.ThreadsSource != nil {
+			posts, err = s.ThreadsSource.ReadSince(ctx, source.Handle, lastPostID)
+		} else {
+			posts, err = s.Threads.ReadSince(ctx, source.Handle, lastPostID)
+		}
 	default:
 		return fmt.Errorf("unsupported source platform %q", source.Platform)
 	}
@@ -90,7 +136,7 @@ func (s *Service) pollSource(ctx context.Context, source store.Source) error {
 	}
 	sort.Slice(posts, func(i, j int) bool { return posts[i].ID < posts[j].ID })
 	if lastPostID == 0 {
-		if source.Platform == "x" || !s.ReplayLatestOnFirstPoll {
+		if source.Platform == "x" || (source.Platform == "telegram" && !s.ReplayLatestOnFirstPoll) {
 			return s.Store.SetCursor(ctx, source.ID, posts[len(posts)-1].ID)
 		}
 		posts = posts[len(posts)-1:]
@@ -106,28 +152,35 @@ func (s *Service) pollSource(ctx context.Context, source store.Source) error {
 		if p.ID <= lastPostID {
 			continue
 		}
-		media := make([]string, 0, len(p.ImageURLs)+len(p.VideoURLs))
-		for _, imageURL := range p.ImageURLs {
+		items := p.MediaItems
+		if len(items) == 0 {
+			for _, imageURL := range p.ImageURLs {
+				items = append(items, telegram.MediaItem{URL: imageURL, Kind: "IMAGE"})
+			}
+			for _, videoURL := range p.VideoURLs {
+				items = append(items, telegram.MediaItem{URL: videoURL, Kind: "VIDEO"})
+			}
+		}
+		media := make([]string, 0, len(items))
+		mediaSourceURLs := make([]string, 0, len(items))
+		for _, item := range items {
 			if len(media) == 10 {
 				return fmt.Errorf("post %d exceeds 10 media items", p.ID)
 			}
-			path, err := s.Media.Save(ctx, imageURL)
+			var path string
+			var err error
+			if item.Kind == "VIDEO" {
+				path, err = s.Media.SaveVideo(ctx, item.URL)
+			} else {
+				path, err = s.Media.Save(ctx, item.URL)
+			}
 			if err != nil {
-				return fmt.Errorf("save image for post %d: %w", p.ID, err)
+				return fmt.Errorf("save media for post %d: %w", p.ID, err)
 			}
 			media = append(media, path)
+			mediaSourceURLs = append(mediaSourceURLs, item.URL)
 		}
-		for _, videoURL := range p.VideoURLs {
-			if len(media) == 10 {
-				return fmt.Errorf("post %d exceeds 10 media items", p.ID)
-			}
-			path, err := s.Media.SaveVideo(ctx, videoURL)
-			if err != nil {
-				return fmt.Errorf("save video for post %d: %w", p.ID, err)
-			}
-			media = append(media, path)
-		}
-		postID, err := s.Store.SavePost(ctx, source.ID, store.Post{ExternalID: strconv.FormatInt(p.ID, 10), URL: p.URL, Text: p.Text, MediaPaths: media, PublishedAt: p.PublishedAt})
+		postID, err := s.Store.SavePost(ctx, source.ID, store.Post{ExternalID: strconv.FormatInt(p.ID, 10), URL: p.URL, Text: p.Text, MediaPaths: media, MediaSourceURLs: mediaSourceURLs, PublishedAt: p.PublishedAt})
 		if err != nil {
 			return err
 		}
@@ -145,6 +198,8 @@ func (s *Service) pollSource(ctx context.Context, source store.Source) error {
 			style := route.Destination.StylePrompt
 			if route.Destination.Platform == "x" {
 				style += "\nПубликация для X: максимум 240 символов вместе с заголовком. Не добавляй Markdown, ссылки, хэштеги и подписи."
+			} else if route.Destination.Platform == "threads" {
+				style += "\nПубликация для Threads: максимум 450 символов. Не добавляй Markdown и чужие подписи."
 			}
 			body := ""
 			if strings.TrimSpace(p.Text) != "" {
@@ -156,7 +211,10 @@ func (s *Service) pollSource(ctx context.Context, source store.Source) error {
 			if route.Destination.Platform == "x" && (utf8.RuneCountInString(body) > 280 || (strings.TrimSpace(body) == "" && len(media) == 0)) {
 				return fmt.Errorf("X rewrite for post %d exceeds 280 characters or is empty without media", p.ID)
 			}
-			if err = s.Store.AddDraft(ctx, route.ID, postID, route.Destination, body, media); err != nil {
+			if route.Destination.Platform == "threads" && utf8.RuneCountInString(body) > 500 {
+				return fmt.Errorf("Threads rewrite for post %d exceeds 500 characters", p.ID)
+			}
+			if err = s.Store.AddDraft(ctx, route.ID, postID, route.Destination, body, media, mediaSourceURLs); err != nil {
 				return err
 			}
 		}
@@ -169,8 +227,13 @@ func (s *Service) pollSource(ctx context.Context, source store.Source) error {
 func (s *Service) PublishReady(ctx context.Context) error {
 	var failures []error
 	for i := 0; i < 100; i++ {
-		canX := s.X.ConsumerKey != "" && s.X.ConsumerSecret != "" && s.XTokenCipher.Enabled()
-		draft, dest, ok, err := s.Store.ClaimReady(ctx, s.Bot.Token != "", canX || s.X.CanPublish(), s.X.CanPublish())
+		if enabled, err := s.Store.AutomationEnabled(ctx); err != nil {
+			return err
+		} else if !enabled {
+			break
+		}
+		canX := s.platformEnabled("x") && s.X.ConsumerKey != "" && s.X.ConsumerSecret != "" && s.XTokenCipher.Enabled()
+		draft, dest, ok, err := s.Store.ClaimReady(ctx, s.platformEnabled("telegram") && s.Bot.Token != "", canX || (s.platformEnabled("x") && s.X.CanPublish()), s.platformEnabled("x") && s.X.CanPublish(), s.platformEnabled("threads") && s.Threads.AccessToken != "")
 		if err != nil {
 			return err
 		}
@@ -196,6 +259,8 @@ func (s *Service) PublishReady(ctx context.Context) error {
 			if publishErr == nil {
 				externalID, publishErr = client.Publish(ctx, draft.Body, draft.MediaPaths)
 			}
+		case "threads":
+			externalID, publishErr = s.Threads.Publish(ctx, strings.TrimPrefix(dest.ChatID, "@"), draft.Body, draft.MediaSourceURLs, draft.MediaPaths)
 		default:
 			publishErr = fmt.Errorf("unsupported destination platform %q", dest.Platform)
 		}
@@ -210,6 +275,8 @@ func (s *Service) PublishReady(ctx context.Context) error {
 		if publishErr != nil {
 			s.Logger.Error("publish failed", "draft_id", draft.ID, "error", publishErr)
 			failures = append(failures, fmt.Errorf("draft %d: %w", draft.ID, publishErr))
+		} else {
+			s.Logger.Info("publish completed", "draft_id", draft.ID, "platform", dest.Platform, "external_id", externalID)
 		}
 	}
 	return errors.Join(failures...)

@@ -172,5 +172,5 @@ func (m MediaStore) SaveVideo(ctx context.Context, rawURL string) (string, error
 }
 
 func allowedMediaHost(host string) bool {
-	return host == "telesco.pe" || strings.HasSuffix(host, ".telesco.pe") || strings.HasSuffix(host, ".cdn-telegram.org") || host == "pbs.twimg.com" || host == "video.twimg.com"
+	return host == "telesco.pe" || strings.HasSuffix(host, ".telesco.pe") || strings.HasSuffix(host, ".cdn-telegram.org") || host == "pbs.twimg.com" || host == "video.twimg.com" || strings.HasSuffix(host, ".cdninstagram.com") || strings.HasSuffix(host, ".fbcdn.net")
 }

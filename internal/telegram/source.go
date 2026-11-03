@@ -24,8 +24,11 @@ type PublicPost struct {
 	Text        string
 	ImageURLs   []string
 	VideoURLs   []string
+	MediaItems  []MediaItem
 	PublishedAt time.Time
 }
+
+type MediaItem struct{ URL, Kind string }
 
 func ParseHandle(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
